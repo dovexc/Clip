@@ -1,0 +1,18 @@
+## .NET / C# ##
+bin/
+obj/
+publish/
+*.user
+*.suo
+.vs/
+*.swp
+
+## FFmpeg binary (large file, not tracked) ##
+ffmpeg.exe
+
+## Settings file (user-specific) ##
+*.json
+
+## OS ##
+Thumbs.db
+.DS_Store
