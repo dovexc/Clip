@@ -241,7 +241,7 @@ public class RecordingService : IDisposable
                     StartInfo = new ProcessStartInfo
                     {
                         FileName = ffmpegPath,
-                        Arguments = $"-y -f concat -safe 0 -i \"{listFile}\" -c copy \"{output}\"",
+                        Arguments = $"-y -nostdin -f concat -safe 0 -i \"{listFile}\" -c copy \"{output}\"",
                         UseShellExecute = false,
                         CreateNoWindow = true,
                     }

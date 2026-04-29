@@ -12,16 +12,21 @@ public static class SettingsService
 
     public static AppSettings Load()
     {
+        AppSettings settings;
         try
         {
-            if (File.Exists(SettingsPath))
-            {
-                string json = File.ReadAllText(SettingsPath);
-                return JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
-            }
+            settings = File.Exists(SettingsPath)
+                ? JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath)) ?? new AppSettings()
+                : new AppSettings();
         }
-        catch { }
-        return new AppSettings();
+        catch { settings = new AppSettings(); }
+
+        // Migrate: old default was 10 s, which causes up to 10 s of missing footage per clip.
+        // Force it to 2 s so the open-segment gap is at most ~2 s.
+        if (settings.SegmentDurationSeconds >= 5)
+            settings.SegmentDurationSeconds = 2;
+
+        return settings;
     }
 
     public static void Save(AppSettings settings)
