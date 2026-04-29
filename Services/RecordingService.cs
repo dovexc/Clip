@@ -16,8 +16,17 @@ public class RecordingService : IDisposable
     private readonly string _logFile;
     private Process? _ffmpegProcess;
     private int _maxSegments;
-    // Tracks when the last clip was triggered so consecutive clips don't overlap
+
+    // Tracks when the last clip was triggered so consecutive clips don't overlap.
     private DateTime _lastClipSaveTime = DateTime.MinValue;
+
+    // FileSystemWatcher tells us exactly which segment FFmpeg is actively writing.
+    // We cannot rely on LastWriteTime to identify the open segment: when the circular
+    // buffer wraps and FFmpeg overwrites seg000.ts, Windows does NOT update that
+    // file's LastWriteTime until it is closed again. The open segment therefore looks
+    // like the oldest file in a sort, and the wrong segment gets excluded.
+    private FileSystemWatcher? _segWatcher;
+    private volatile string? _currentSegmentName; // filename only, e.g. "seg003.ts"
 
     public bool IsRecording { get; private set; }
     public event Action<string>? LogReceived;
@@ -43,8 +52,22 @@ public class RecordingService : IDisposable
         foreach (var f in Directory.GetFiles(_tempDir, "seg*.ts"))
             try { File.Delete(f); } catch { }
 
-        // Reset clip boundary so the first clip of a new session is always a full window.
-        _lastClipSaveTime = DateTime.MinValue;
+        // Reset state for the new session.
+        _lastClipSaveTime  = DateTime.MinValue;
+        _currentSegmentName = null;
+
+        // Watch the buffer folder so we always know which segment is open.
+        // Created fires when FFmpeg starts a brand-new file (first pass).
+        // Changed fires when FFmpeg truncates an existing file (circular wrap)
+        // or writes data to it – either way it is the active segment.
+        _segWatcher?.Dispose();
+        _segWatcher = new FileSystemWatcher(_tempDir, "seg*.ts")
+        {
+            NotifyFilter        = NotifyFilters.FileName | NotifyFilters.LastWrite,
+            EnableRaisingEvents = true,
+        };
+        _segWatcher.Created += (_, e) => _currentSegmentName = e.Name;
+        _segWatcher.Changed += (_, e) => _currentSegmentName = e.Name;
 
         string args = BuildArgs();
 
@@ -52,12 +75,12 @@ public class RecordingService : IDisposable
         {
             StartInfo = new ProcessStartInfo
             {
-                FileName = ffmpegPath,
-                Arguments = args,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardError = true,
-                RedirectStandardInput = true,
+                FileName               = ffmpegPath,
+                Arguments              = args,
+                UseShellExecute        = false,
+                CreateNoWindow         = true,
+                RedirectStandardError  = true,
+                RedirectStandardInput  = true,
             },
             EnableRaisingEvents = true
         };
@@ -104,23 +127,21 @@ public class RecordingService : IDisposable
         string videoInput = $"-f gdigrab -framerate {_settings.Fps} -draw_mouse 1 " +
                             $"-offset_x 0 -offset_y 0 -video_size {w}x{h} -i desktop";
 
-        // -g forces a keyframe every SegmentDurationSeconds so the segment muxer can
-        // always cut exactly on time. Without this libx264 defaults to 250 frames
-        // (~8 s at 30 fps) and segments end up irregularly sized.
+        // -g / -keyint_min force keyframes exactly on the segment boundary so the
+        // segment muxer can always cut at the right time.
         int gop = _settings.Fps * _settings.SegmentDurationSeconds;
-        string videoCodec = $"-c:v libx264 -preset ultrafast -tune zerolatency -crf 23 -pix_fmt yuv420p -g {gop} -keyint_min {gop}";
+        string videoCodec = $"-c:v libx264 -preset ultrafast -tune zerolatency -crf 23 " +
+                            $"-pix_fmt yuv420p -g {gop} -keyint_min {gop}";
 
         bool hasSys = _settings.CaptureSystemAudio && !string.IsNullOrEmpty(_settings.SystemAudioDevice);
         bool hasMic = _settings.CaptureMicrophone  && !string.IsNullOrEmpty(_settings.MicrophoneDevice);
 
-        // Gerät-ID ist "AnzeigeName|GUID-ID" → GUID verwenden (ASCII-sicher)
         string sysId = DeviceId(_settings.SystemAudioDevice);
         string micId = DeviceId(_settings.MicrophoneDevice);
 
         string audioFlags = "-thread_queue_size 512 -use_wallclock_as_timestamps 1 -f dshow";
         string muxFlags   = "-max_interleave_delta 0 -avoid_negative_ts make_zero";
 
-        // Dasselbe Gerät darf nicht zweimal geöffnet werden → kein amix
         bool sameDevice = hasSys && hasMic && sysId == micId;
         if (sameDevice) hasMic = false;
 
@@ -159,6 +180,10 @@ public class RecordingService : IDisposable
     public void StopRecording()
     {
         if (!IsRecording || _ffmpegProcess == null) return;
+
+        _segWatcher?.Dispose();
+        _segWatcher = null;
+
         try
         {
             _ffmpegProcess.StandardInput.Write("q");
@@ -171,19 +196,19 @@ public class RecordingService : IDisposable
 
     public void SaveClipAsync()
     {
-        // Capture the exact moment the user triggered the save.
-        // This is used both for the overlap guard and for updating _lastClipSaveTime.
-        DateTime triggerTime = DateTime.Now;
+        // Snapshot both the trigger time and the current open segment name right now,
+        // before the background thread runs (segment could switch in the meantime).
+        DateTime triggerTime   = DateTime.Now;
+        string?  openSegName   = _currentSegmentName; // e.g. "seg003.ts"
 
         Task.Run(() =>
         {
             try
             {
-                // Refresh() forces the OS to flush cached metadata so LastWriteTime is accurate.
+                // Read all segments with fresh metadata.
                 var allSegs = Directory.GetFiles(_tempDir, "seg*.ts")
                     .Select(f => { var fi = new FileInfo(f); fi.Refresh(); return fi; })
                     .Where(fi => fi.Length > 1000)
-                    .OrderBy(fi => fi.LastWriteTime)
                     .ToList();
 
                 if (allSegs.Count == 0)
@@ -192,11 +217,32 @@ public class RecordingService : IDisposable
                     return;
                 }
 
-                // The last entry (most recent LastWriteTime) is the segment FFmpeg is currently
-                // writing. It is incomplete/open, so exclude it from any clip.
-                var complete = allSegs.Count > 1
-                    ? allSegs.Take(allSegs.Count - 1).ToList()
-                    : allSegs;
+                // Exclude the segment FFmpeg has open right now (it is incomplete).
+                // We know its name from the FileSystemWatcher, so the exclusion is
+                // exact regardless of how LastWriteTime compares across files.
+                List<FileInfo> complete;
+                if (openSegName != null)
+                {
+                    complete = allSegs
+                        .Where(fi => !fi.Name.Equals(openSegName, StringComparison.OrdinalIgnoreCase))
+                        .OrderBy(fi => fi.LastWriteTime) // accurate for closed segments
+                        .ToList();
+                }
+                else
+                {
+                    // Watcher not fired yet (recording just started) – fall back to
+                    // removing whichever file has the most recent LastWriteTime.
+                    complete = allSegs
+                        .OrderBy(fi => fi.LastWriteTime)
+                        .SkipLast(1)
+                        .ToList();
+                }
+
+                if (complete.Count == 0)
+                {
+                    ErrorOccurred?.Invoke("Keine vollständigen Segmente vorhanden.");
+                    return;
+                }
 
                 int needed = (int)Math.Ceiling(
                     (double)_settings.ClipDurationSeconds / _settings.SegmentDurationSeconds);
@@ -208,9 +254,8 @@ public class RecordingService : IDisposable
 
                 if (withinClipWindow)
                 {
-                    // Second (or later) clip triggered before the full clip window has elapsed.
-                    // Only take segments completed AFTER the last clip was triggered so the
-                    // two clips don't share any footage.
+                    // Only include footage recorded since the last clip ended so the
+                    // two clips share no frames.
                     toMerge = complete
                         .Where(fi => fi.LastWriteTime > _lastClipSaveTime)
                         .ToList();
@@ -223,7 +268,7 @@ public class RecordingService : IDisposable
                 }
                 else
                 {
-                    // Normal path: grab the most recent N complete segments (= ClipDuration seconds).
+                    // Normal path: last N complete segments = ClipDuration seconds.
                     toMerge = complete.TakeLast(Math.Min(needed, complete.Count)).ToList();
                 }
 
@@ -240,10 +285,10 @@ public class RecordingService : IDisposable
                 {
                     StartInfo = new ProcessStartInfo
                     {
-                        FileName = ffmpegPath,
-                        Arguments = $"-y -nostdin -f concat -safe 0 -i \"{listFile}\" -c copy \"{output}\"",
+                        FileName        = ffmpegPath,
+                        Arguments       = $"-y -nostdin -f concat -safe 0 -i \"{listFile}\" -c copy \"{output}\"",
                         UseShellExecute = false,
-                        CreateNoWindow = true,
+                        CreateNoWindow  = true,
                     }
                 };
                 proc.Start();
@@ -263,7 +308,8 @@ public class RecordingService : IDisposable
         });
     }
 
-    // Listet alle dshow-Audiogeräte auf (Mikrofone)
+    // ── Audio device helpers ────────────────────────────────────────────────
+
     public static List<string> GetMicrophoneDevices(string ffmpegPath)
     {
         var devices = new List<string>();
@@ -277,19 +323,18 @@ public class RecordingService : IDisposable
             {
                 StartInfo = new ProcessStartInfo
                 {
-                    FileName = ffmpegPath,
-                    Arguments = "-list_devices true -f dshow -i dummy",
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardError = true,
-                    StandardErrorEncoding = System.Text.Encoding.UTF8,
+                    FileName               = ffmpegPath,
+                    Arguments              = "-list_devices true -f dshow -i dummy",
+                    UseShellExecute        = false,
+                    CreateNoWindow         = true,
+                    RedirectStandardError  = true,
+                    StandardErrorEncoding  = System.Text.Encoding.UTF8,
                 }
             };
             proc.Start();
             string output = proc.StandardError.ReadToEnd();
             proc.WaitForExit(5000);
 
-            // Gerätename (audio) gefolgt von Alternative name → GUID verwenden
             string? pendingName = null;
             foreach (var line in output.Split('\n'))
             {
@@ -303,14 +348,12 @@ public class RecordingService : IDisposable
                 {
                     int s = line.IndexOf('"') + 1;
                     int e = line.LastIndexOf('"');
-                    // GUID-ID hat kein Unicode → ASCII-sicher
                     string id = e > s ? line.Substring(s, e - s) : pendingName;
                     devices.Add($"{pendingName}|{id}");
                     pendingName = null;
                 }
                 else if (pendingName != null && !line.Contains("Alternative"))
                 {
-                    // Kein Alternative name vorhanden → Anzeigename als Fallback
                     devices.Add($"{pendingName}|{pendingName}");
                     pendingName = null;
                 }
@@ -320,14 +363,12 @@ public class RecordingService : IDisposable
         return devices;
     }
 
-    // Gibt die GUID-ID zurück (Teil nach '|'), Fallback auf den ganzen Wert
     private static string DeviceId(string stored)
     {
         int pipe = stored.IndexOf('|');
         return pipe >= 0 ? stored[(pipe + 1)..] : stored;
     }
 
-    // Gibt den Anzeigenamen zurück (Teil vor '|')
     public static string DeviceDisplayName(string stored)
     {
         int pipe = stored.IndexOf('|');
@@ -350,6 +391,7 @@ public class RecordingService : IDisposable
     public void Dispose()
     {
         StopRecording();
+        _segWatcher?.Dispose();
         _ffmpegProcess?.Dispose();
     }
 }
